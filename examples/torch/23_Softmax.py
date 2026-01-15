@@ -10,7 +10,7 @@ import torch.nn as nn
 from mlir import ir
 from mlir.dialects import arith
 from mlir.dialects import linalg
-from mlir.dialects.transform.xegpu import SetDescLayoutOp
+from mlir.dialects.transform.xegpu import SetDescLayoutOp, SetOpLayoutAttrOp
 from mlir.dialects.transform import ApplyCanonicalizationPatternsOp
 from mlir.dialects.transform.structured import ApplyFoldUnitExtentDimsViaReshapesPatternsOp
 
@@ -55,6 +55,11 @@ class Layout(XegpuLayout):
 
     @override
     def apply(self, ctx: Phase.Context):
+        gpu_func = ctx.gpu_func
+        # SetOpLayoutAttrOp(match(gpu_func, "xegpu.load"), (1, ), (256, ), inst_data=(16, ), index=0, result=True)
+        # SetOpLayoutAttrOp(match(gpu_func, "vector.step"), (1, ), (256, ), inst_data=(16, ), index=0, result=True)
+        # for h in split_handle(match(ctx.gpu_func, ("vector.broadcast")), 3):
+        #     SetOpLayoutAttrOp(h, (1, ), (256, ), inst_data=(16, ), index=0, result=True)
         for nd_tdesc in split_handle(match(ctx.gpu_func, ("xegpu.create_nd_tdesc")), 2):
             SetDescLayoutOp(nd_tdesc, (1, 1), (1, 256), inst_data=(1, 16))
 

@@ -1,5 +1,9 @@
 import torch
-from lighthouse.ingress.torch.pipeline import Bufferization, DpasLayout, GpuKernelOutlining, Pipeline, TilingAndFusion, VectorToXegpu, Vectorization, XeGpu
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from pipeline import Bufferization, DpasLayout, GpuKernelOutlining, Pipeline, TilingAndFusion, VectorToXegpu, Vectorization, XeGpu
 
 mlir = """
   func.func @payload(%arg0: memref<4096x4096xf16>, %arg1: memref<4096x4096xf16>, %arg2: memref<4096x4096xf32>) attributes {llvm.emit_c_interface} {
@@ -18,18 +22,19 @@ mlir = """
 
 
 class MatmulPipeline(Pipeline):
-    tile = TilingAndFusion("linalg.*").outer((256, 256)).inner((0, 0, 32), tile_only="linalg.matmul")
+    tile = TilingAndFusion((256, 256), "linalg.*").tile((0, 0, 32), "linalg.matmul", "for")
     vectorize = Vectorization()
     bufferize = Bufferization()
-    outline = GpuKernelOutlining(512)
+    outline = GpuKernelOutlining()
     vecToXegpu = VectorToXegpu()
     dpas = DpasLayout()
     xegpu = XeGpu()
 
 
 if __name__ == "__main__":
-    a = torch.tensor([[2.0]*4096]*4096, dtype=torch.float16, device="xpu")
-    b = torch.tensor([[2.0]*4096]*4096, dtype=torch.float16, device="xpu")
+    a = torch.tensor([[2.0] * 4096] * 4096, dtype=torch.float16, device="xpu")
+    b = torch.tensor([[2.0] * 4096] * 4096, dtype=torch.float16, device="xpu")
     c = torch.zeros(4096, 4096, dtype=torch.float32, device="xpu")
+    # MatmulPipeline.tile(mlir).dump()
     MatmulPipeline.exec(mlir, a, b, c, dump=True)
     print(c)

@@ -3,19 +3,25 @@ import os
 import re
 
 from abc import ABC, abstractmethod
-from mlir import ir
+
+from numpy import mod
+from mlir import ir, passmanager
+from mlir.dialects._omp_ops_gen import target
 from mlir.execution_engine import ExecutionEngine
 from mlir.dialects.bufferization import LayoutMapOption
-from mlir.dialects.transform import (AnnotateOp, AnyOpType, AnyValueType, ApplyCanonicalizationPatternsOp, GetOperandOp,
+from mlir.dialects.transform import (AnnotateOp, AnyOpType, AnyValueType, ApplyCanonicalizationPatternsOp,
+                                     ApplyDeadCodeEliminationOp, GetOperandOp, GetParentOp,
                                      ApplyCommonSubexpressionEliminationOp, ApplyPatternsOp, FailurePropagationMode,
                                      NamedSequenceOp, OptionValueTypes, ParamConstantOp, PrintOp, SequenceOp,
                                      SplitHandleOp, YieldOp, apply_licm, apply_registered_pass, get_producer_of_operand)
 from mlir.dialects.transform.interpreter import apply_named_sequence
+from mlir.dialects.transform.gpu import MapNestedForallToThreads
 from mlir.dialects.transform.loop import HoistLoopInvariantSubsetsOp, ForallToParallelOp
+from mlir.dialects.transform.memref import MemRefEraseDeadAllocAndStoresOp, ApplyAllocToAllocaOp
 from mlir.dialects.transform.bufferization import OneShotBufferizeOp
-from mlir.dialects.transform.structured import (FuseIntoContainingOp, MatchOp, TileUsingForOp, TileUsingForallOp,
-                                                TileReductionUsingForOp, TileReductionUsingForallOp,
-                                                VectorizeChildrenAndApplyPatternsOp)
+from mlir.dialects.transform.structured import (ApplyFoldUnitExtentDimsViaReshapesPatternsOp, FuseIntoContainingOp,
+                                                MatchOp, TileUsingForOp, TileUsingForallOp, TileReductionUsingForOp,
+                                                TileReductionUsingForallOp, VectorizeChildrenAndApplyPatternsOp)
 from mlir.dialects.transform.xegpu import GetDescOp, SetDescLayoutOp, SetGPULaunchThreadsOp, SetOpLayoutAttrOp
 from mlir.ir import InsertionPoint, UnitAttr
 from torch import Tensor, nn
@@ -35,6 +41,10 @@ def split_handle(handle: Union[ir.Value, ir.OpResult], count: int) -> ir.OpResul
 
 def cse(target: Union[ir.Value, ir.OpResult]):
     ApplyCommonSubexpressionEliminationOp(target)
+
+
+def dce(target: Union[ir.Value, ir.OpResult]):
+    ApplyDeadCodeEliminationOp(target)
 
 
 def apply_patterns(target: Union[ir.Value, ir.OpResult]) -> ir.InsertionPoint:
@@ -306,6 +316,13 @@ class Pipeline(metaclass=PipelineMeta):
             def __exit__(self, *args):
                 YieldOp()
                 self.seq_ip.__exit__(*args)
+
+                # Cleanup the transform module
+                # pm = passmanager.PassManager(context=self.mod.context)
+                # pm.add("cse")
+                # pm.add("canonicalize")
+                # pm.run(self.mod.operation)
+
                 if self.dump:
                     print(f"{self.mod}\n// -----\n")
 
@@ -362,7 +379,8 @@ class OpNameMatcher:
         self.patterns: Dict[str, re.Pattern] = {}
         self.add(*op_name_or_pattern)
 
-    def add(self, *op_name_or_pattern: Union[str, re.Pattern]):
+    def add(self, *op_name_or_pattern: Union[str, re.Pattern, Iterable[Union[str, re.Pattern]]]) -> OpNameMatcher:
+        op_name_or_pattern = [n for p in op_name_or_pattern for n in ((p, ) if isinstance(p, str | re.Pattern) else p)]
         for name in [n for p in op_name_or_pattern for n in (p.split(",") if isinstance(p, str) else (p, ))]:
             if isinstance(name, re.Pattern):
                 self.patterns[name.pattern] = name
@@ -496,11 +514,11 @@ class TilingAndFusion(Phase):
     def fuse(self,
              op_names_or_patterns: OpNamesOrPatternsType,
              no_fuse: OptionalOpNamesOrPatternsType = None) -> TilingAndFusion:
-        m = OpNameMatcher(*op_names_or_patterns)
+        m = OpNameMatcher(op_names_or_patterns)
         self.params[-1].fuse.update(m)
         self.supported_ops.update(m)
         if no_fuse is not None:
-            m = OpNameMatcher(*no_fuse)
+            m = OpNameMatcher(no_fuse)
             self.params[-1].no_fuse.update(m)
             self.supported_ops.update(m)
         return self
@@ -541,17 +559,20 @@ class TilingAndFusion(Phase):
         def visitor(op: ir.Operation):
             name = op.name
             # TODO: check if op implements TilingInterface
-            if not name.endswith(".yield") and self.supported_ops.matches(name):
+            if not name.endswith(".yield"):
                 num = names.get(name, -1) + 1
-                names[name] = num
-                op_to_info[op] = TilingAndFusion.OpInfo(op, num)
+                if num or self.supported_ops.matches(name, num):
+                    names[name] = num
+                    op_to_info[op] = TilingAndFusion.OpInfo(op, num)
             return ir.WalkResult.ADVANCE
 
         # Collect all supported ops
         ctx.payload.body.operations[0].walk(visitor)
         mod = ctx.mod
+        matches = match(mod, names)
+        num_handles = len(op_to_info)
+        handles = split_handle(matches, num_handles) if num_handles > 1 else (matches.result, )
         # Assign handles to each op
-        handles = split_handle(match(mod, names), len(op_to_info))
         for i, h in zip(op_to_info.values(), handles):
             i.handle = h
         # Processing in reverse order in order to tile the last ops first and fuse the producers greedily
@@ -566,6 +587,10 @@ class TilingAndFusion(Phase):
 
         cse(mod)
         canonicalize(mod)
+        # with apply_patterns(mod):
+        #     ApplyFoldUnitExtentDimsViaReshapesPatternsOp()
+        #     ApplyCanonicalizationPatternsOp()
+
         ctx.gpu_loop_tile_sizes = dict(sorted(ctx.gpu_loop_tile_sizes.items(), key=lambda i: i[0].location.start_line))
 
     def apply_to(
@@ -582,12 +607,13 @@ class TilingAndFusion(Phase):
 
         # Tile and fuse all the producers
         sizes = params.tile_sizes(op)
-        oi.handle, loop = params.tiling_op(oi.handle, sizes)
+        oi.handle, loop = params.tiling_op(oi.handle, sizes, op.location)
+        if params is self.params[0]:
+            AnnotateOp(loop, "gpu_loop")
+            ctx.gpu_loop_tile_sizes[op] = sizes
+
         for oi in producers.values():
             oi.handle, loop = FuseIntoContainingOp(oi.handle, loop).results
-
-        if params is self.params[0]:
-            ctx.gpu_loop_tile_sizes[op] = sizes
 
         return producers.keys()
 
@@ -602,10 +628,9 @@ class TilingAndFusion(Phase):
         if producers is None:
             producers = {}
         for operand in op.operands:
-            if (isinstance(owner := operand.owner, ir.Operation) and (oi := op_to_info.get(owner, None)) is not None
-                    and match(oi)):
-                producers[owner] = oi
-                self.collect_producers(owner, op_to_info, match, producers)
+            if (oi := op_to_info.get(operand.owner, None)) is not None and match(oi):
+                producers[operand.owner] = oi
+                self.collect_producers(operand.owner, op_to_info, match, producers)
         return producers
 
     # Filter out all the producers, that have consumers not in the producers list
@@ -630,26 +655,29 @@ class TilingAndFusion(Phase):
     class Params:
         _tiling_ops_map: Dict[Tuple[str, bool], TilingAndFusion.TilingOpType] = {
             ("forall", False):
-            lambda t, s: TileUsingForallOp(t, tile_sizes=s).results,
+            lambda t, s, loc=None: TileUsingForallOp(t, tile_sizes=s, loc=loc).results,
             ("forall", True):
-            lambda t, s: TileReductionUsingForallOp(
+            lambda t, s, loc=None: TileReductionUsingForallOp(
                 [AnyOpType.get()],  # fill_op
                 AnyOpType.get(),  # split_op
                 AnyOpType.get(),  # combining_op
                 AnyOpType.get(),  # forall_op
                 target=t,
                 tile_sizes=s,
+                loc=loc,
             ).results[2:],
             ("for", False):
-            lambda t, s: TileUsingForOp(t, sizes=s).results,
+            lambda t, s, loc=None: TilingAndFusion.Params._split_for_loops(
+                TileUsingForOp(t, sizes=s, loc=loc).results, s),
             ("for", True):
-            lambda t, s: TileReductionUsingForOp(
+            lambda t, s, loc=None: TileReductionUsingForOp(
                 [AnyOpType.get()],  # fill_op
                 AnyOpType.get(),  # split_op
                 AnyOpType.get(),  # combining_op
                 AnyOpType.get(),  # for_op
                 target=t,
                 tile_sizes=s,
+                loc=loc,
             ).results[2:],
         }
 
@@ -678,10 +706,7 @@ class TilingAndFusion(Phase):
                         (tile, self.tile), (fuse, self.fuse), (no_tile, self.no_tile), (no_fuse, self.no_fuse)):
                 if map[0] is None:
                     continue
-                if isinstance(map[0], str) or isinstance(map[0], re.Pattern):
-                    m = OpNameMatcher(map[0])
-                else:
-                    m = OpNameMatcher(*map[0])
+                m = OpNameMatcher(map[0])
                 for o in map[1:]:
                     o.update(m)
                 phase.supported_ops.update(m)
@@ -725,6 +750,19 @@ class TilingAndFusion(Phase):
             copy.no_fuse.update(self.no_fuse)
             return copy
 
+        @staticmethod
+        def _split_for_loops(tile_results, sizes):
+            return tile_results
+            loop = SplitHandleOp([AnyOpType.get(), AnyOpType.get()], tile_results[1], overflow_result=0).results[0]
+            return tile_results[0], loop
+            if len(sizes) == 1:
+                return tile_results
+            # loops = split_handle(tile_results[1], len(sizes))
+            # loops = [l for l, s in zip(loops, sizes) if s > 0]
+            # return tile_results[0], loops[0] if len(loops) == 1 else loops
+            # PrintOp(target=GetParentOp(AnyOpType.get(), tile_results[0]).result, name="Parent of")
+            return tile_results[0], GetParentOp(AnyOpType.get(), tile_results[0]).result
+
     class OpInfo:
 
         def __init__(self, op: ir.Operation, num: int):
@@ -743,7 +781,7 @@ class Vectorization(Phase):
         ).result
 
         # hoist loop invariant vector read/store ops
-        HoistLoopInvariantSubsetsOp(match(func, "scf.for"))
+        HoistLoopInvariantSubsetsOp(match(func, ("scf.for", "scf.forall")))
 
         ctx.func = func
         cse(func)
@@ -813,7 +851,8 @@ class GpuKernelOutlining(Phase):
         # convert forall to parallel
         tile_sizes = ctx.gpu_loop_tile_sizes
         num_kernels = len(tile_sizes)
-        for h in split_handle(match(ctx.func, ops=("scf.forall", )), num_kernels):
+        loops = MatchOp(AnyOpType.get(), ctx.func, op_attrs=ir.DictAttr.get({"gpu_loop": ir.UnitAttr.get()}))
+        for h in split_handle(loops, num_kernels):
             ForallToParallelOp([AnyOpType.get()], h)
 
         # convert scf.parallel to gpu.launch
@@ -850,7 +889,8 @@ class VectorToXegpu(Phase):
     @override
     def apply(self, ctx: Phase.Context):
         # convert vector to xegpu
-        ctx.gpu_func = apply_pass(ctx.gpu_func, "convert-vector-to-xegpu", "cse")
+        ctx.gpu_func = apply_pass(ctx.gpu_func, "convert-vector-to-xegpu", "expand-strided-metadata",
+                                  "cse", "canonicalize")
 
 
 class XegpuLayout(Phase):
@@ -972,9 +1012,8 @@ class XeGpu(Phase):
     @override
     def apply(self, ctx: Phase.Context):
         # xegpu distribution
-        apply_pass(ctx.gpu_func, "xegpu-wg-to-sg-distribute", "cse", "lower-affine", "cse", "xegpu-blocking",
-                   "canonicalize", "cse", "xegpu-propagate-layout")
-
+        propagate = ("xegpu-propagate-layout", {"layout-kind": "inst"})
+        apply_pass(ctx.gpu_func, "xegpu-wg-to-sg-distribute", propagate, "cse", "lower-affine", "cse", "xegpu-blocking", "canonicalize", "cse")
         ctx.gpu_mod = apply_pass(ctx.gpu_mod, "xegpu-subgroup-distribute", "canonicalize", "cse",
                                  "loop-invariant-code-motion", "cse", "xegpu-vector-linearize", "convert-xegpu-to-xevm",
                                  ("convert-gpu-to-llvm-spv", {
